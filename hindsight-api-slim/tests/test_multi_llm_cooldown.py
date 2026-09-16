@@ -684,3 +684,76 @@ async def test_classified_log_redacts_provider_exception_and_uses_label(
     assert await _router(primary, fallback).call(messages=[]) == "fallback"
     assert "synthetic-sensitive-body" not in caplog.text
     assert "label=primary" in caplog.text
+
+
+def test_half_open_probe_lease_is_shared_across_event_loops() -> None:
+    """One router grants one probe lease across threads that each run their own loop.
+
+    The engine's LLM permits are cross-loop (``CrossLoopSemaphore``), so the router
+    guards its state with a ``threading.Lock`` rather than an ``asyncio.Lock``. This
+    pins that choice: followers on other loops must skip the in-flight probe rather
+    than wait behind it or take a second lease.
+    """
+    calls_lock = threading.Lock()
+    probe_entered = threading.Event()
+    release_probe = threading.Event()
+
+    class CrossLoopMember(Member):
+        def __init__(self, name: str, *, quota_once: bool = False) -> None:
+            super().__init__(name, delay=0.0, max_backoff=1.0)
+            self.quota_once = quota_once
+
+        async def _call(self, **kwargs: Any) -> Any:
+            with calls_lock:
+                self.calls += 1
+                call_number = self.calls
+            if not self.quota_once:
+                return "fallback"
+            if call_number == 1:
+                raise QuotaError("cool down")
+            probe_entered.set()
+            while not release_probe.is_set():
+                await asyncio.sleep(0.001)
+            return "recovered"
+
+    primary = CrossLoopMember("primary", quota_once=True)
+    fallback = CrossLoopMember("fallback")
+    router = _router(primary, fallback)
+
+    assert asyncio.run(router.call(messages=[])) == "fallback"
+
+    results: list[str] = []
+    errors: list[BaseException] = []
+    result_lock = threading.Lock()
+
+    def run_call() -> None:
+        try:
+            result = asyncio.run(router.call(messages=[]))
+            with result_lock:
+                results.append(result)
+        except BaseException as exc:  # noqa: BLE001 - asserted below
+            with result_lock:
+                errors.append(exc)
+
+    owner = threading.Thread(target=run_call)
+    owner.start()
+    followers: list[threading.Thread] = []
+    try:
+        assert probe_entered.wait(timeout=2.0), "the half-open owner never entered its probe"
+
+        followers = [threading.Thread(target=run_call) for _ in range(3)]
+        for follower in followers:
+            follower.start()
+        for follower in followers:
+            follower.join(timeout=2.0)
+            assert not follower.is_alive(), "a follower waited behind the in-flight probe"
+    finally:
+        release_probe.set()
+        for follower in followers:
+            follower.join(timeout=2.0)
+        owner.join(timeout=2.0)
+
+    assert not owner.is_alive(), "the half-open owner did not finish"
+    assert not errors, f"multi-LLM router failed across loops: {errors[:1]}"
+    assert sorted(results) == ["fallback", "fallback", "fallback", "recovered"]
+    assert primary.calls == 2

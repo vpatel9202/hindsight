@@ -476,7 +476,7 @@ resolves the same `auth.json`. To run more than one independently authorized
 ChatGPT account — for example, to fail over when the preferred account hits its
 usage limit — give each one its own credentials directory with
 `HINDSIGHT_API_LLM_CODEX_HOME` (primary) and `HINDSIGHT_API_LLM_<n>_CODEX_HOME`
-(indexed multi-LLM chain
+(indexed [multi-LLM chain](./configuration#multi-llm-strategies-failover--round-robin)
 members). Each falls back to `CODEX_HOME`, then `~/.codex`, when unset.
 
 ```bash
@@ -498,15 +498,17 @@ as `preferred` and `secondary` to distinguish members in routing diagnostics.
 Those are the only label forms; every operation primary shares the global label.
 
 An explicit Codex HTTP 429 after its own retries puts that member into router-local
-cooldown for `Retry-After`, or 60 seconds when the header is invalid or absent. One
-request probes it after expiry. State is not shared across router instances, worker
+cooldown for `Retry-After` (60 seconds when the header is invalid or absent), or until
+the reset time a usage-limit response names. One request probes it after expiry. State is not shared across router instances, worker
 processes, or restarts. Short all-member waits are handled once inline; longer waits
 defer asynchronous worker operations to the sanitized retry time without consuming
 their retry count. Synchronous recall and reflect cannot defer and retain the existing
 generic HTTP 500 conversion with the sanitized retry-time message. Confirmed invalid,
 expired, or reused refresh credentials raise the original exception unchanged, without
 fallback or cooldown. Other auth errors, timeouts, and 5xx responses retain generic
-retry/failover behavior. Batch retain remains bound to its submitting member.
+retry/failover behavior. Batch retain remains bound to its submitting member. Set
+`HINDSIGHT_API_LLM_MAX_RETRIES=0` on the primary to hand off on the first 429 rather
+than after its own retries.
 
 ---
 

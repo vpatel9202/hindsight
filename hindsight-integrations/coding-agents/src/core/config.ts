@@ -18,6 +18,7 @@ import { DEFAULT_SEED_LIMIT } from "./seed";
 import { isOptedIn } from "./bank";
 import { log } from "./log";
 import { DEFAULT_OBSERVATION_SCOPES, type ObservationScopes } from "./hindsight";
+import { DEFAULT_PAGE_TRIGGER_CRON, isHashedCron, parseHashedCron } from "./missions";
 
 /** Default config-file path: ~/.hindsight/coding-agent.json */
 export // HINDSIGHT_CONFIG joins the two env exceptions (diag/log files): it points at THE config file,
@@ -87,10 +88,13 @@ export interface RawConfig {
    *  200 while bursts get 429s means the server is rate-limiting concurrency, not total volume —
    *  lower this rather than raising it. */
   maxParallelRetains?: number;
-  reflectTimeoutMs?: number; // session-start reflect timeout (default 120000; hooks cap lower internally)
+  /** Automatic session-reflect timeout (default 20000). The default, with the fallback chain after
+   *  it, fits the 30s prompt-hook timeout the installer registers on hook harnesses; going higher
+   *  there needs that host timeout raised too, or the host kills the hook mid-reflect. */
+  reflectTimeoutMs?: number;
   /** Timeout for the agent-invoked `hindsight_reflect` tool (default 330000). Deliberately its own
    *  knob and much larger than `reflectTimeoutMs`: that one bounds an automatic hook that must fit
-   *  the host's 25s window, whereas this one bounds a call the agent made on purpose and waits on,
+   *  the host's hook window, whereas this one bounds a call the agent made on purpose and waits on,
    *  whose `budget: "high"` synthesis on a populated bank can run for minutes. The default sits
    *  ABOVE the server's own reflect wall timeout (HINDSIGHT_API_REFLECT_WALL_TIMEOUT, 300s) so the
    *  server decides when to give up, not an arbitrary client deadline (#3590). Unset, it inherits
@@ -107,14 +111,19 @@ export interface RawConfig {
   pageRefreshEveryTurns?: number; // knowledge-page refresh cadence in user turns (default 10)
   /** What it COSTS to keep this project's knowledge pages current — the trigger stamped on every
    *  page this plugin creates (the seeded taxonomy and each captured initiative):
-   *    "auto-refresh" (default) — refresh after every consolidation that produced new material
-   *    "cron"                   — refresh on `pageTriggerCron` only, and only when actually stale
+   *    "cron" (default)         — refresh on `pageTriggerCron` only, and only when actually stale
+   *    "auto-refresh"           — refresh after every consolidation that produced new material
    *    "manual"                 — never refresh on its own; the tools and control plane still can
    *  Auto-refresh is both the most current and the most expensive: one LLM synthesis per page per
-   *  consolidation, which adds up fast across auto-surveyed repos (#3506). Existing pages keep the
-   *  trigger they were created with — this changes what NEW pages get. */
+   *  consolidation, which adds up fast across auto-surveyed repos (#3506) — hence the hourly
+   *  staggered schedule as the default. Existing pages keep the trigger they were created with —
+   *  this changes what NEW pages get. */
   pageTriggerType?: "auto-refresh" | "cron" | "manual";
-  /** Schedule for `pageTriggerType: "cron"` — UTC, standard 5-field cron, e.g. "0 3 * * *". */
+  /** Schedule for `pageTriggerType: "cron"` — UTC, standard 5-field cron, e.g. "0 3 * * *".
+   *  Defaults to DEFAULT_PAGE_TRIGGER_CRON ("H * * * *": hourly, on each page's own minute).
+   *  A field written `H` ("0 3 * * *" -> "H H * * *") is replaced per page by a value hashed from
+   *  bank + page name, so pages spread across the period instead of all firing on the one minute
+   *  this shared setting names. See `expandCronHash` in core/missions.ts. */
   pageTriggerCron?: string;
   autoSeed?: boolean; // SessionStart: auto-seed a cold repo's bank from git history (default true)
   seedLimit?: number; // SessionStart auto-seed: most-recent-N-commits cap (default 300)
@@ -225,25 +234,45 @@ export interface Config {
 }
 
 /**
- * Which page-refresh trigger a raw config asks for.
+ * The page-refresh trigger a raw config asks for: the schedule kind, and the expression it fires on.
  *
- * `"cron"` without a `pageTriggerCron` is a broken config, not a request to stop refreshing: the
- * API rejects a cron trigger with no expression, which would fail page creation outright. Fall
- * back to the default and say so — a user who wants pages to stop refreshing writes "manual".
+ * `"cron"` is the default and needs no `pageTriggerCron`: an omitted expression takes
+ * DEFAULT_PAGE_TRIGGER_CRON, so the common config — none of these fields at all — is an hourly
+ * staggered refresh. A user who wants pages to stop refreshing on their own writes "manual".
+ *
+ * A malformed `H` is refused here and not one step later: `expandCronHash` leaves an expression it
+ * cannot read alone, so an unchecked `"H(9-3) * * * *"` would reach the server verbatim and fail
+ * page creation with a cron parse error naming syntax this package invented. Such an expression
+ * takes the default schedule, with a warning — the same as writing none. Ordinary cron syntax
+ * stays unvalidated: the server owns that, and duplicating its parser here would only disagree
+ * with it.
  */
-function resolvePageTriggerType(raw: RawConfig): "auto-refresh" | "cron" | "manual" {
-  if (raw.pageTriggerType === "manual") return "manual";
-  if (raw.pageTriggerType === "cron") {
-    if (raw.pageTriggerCron?.trim()) return "cron";
+function resolvePageTrigger(raw: RawConfig): {
+  type: "auto-refresh" | "cron" | "manual";
+  cron?: string;
+} {
+  if (raw.pageTriggerType === "manual") return { type: "manual" };
+  if (raw.pageTriggerType === "auto-refresh") return { type: "auto-refresh" };
+  if (raw.pageTriggerType !== undefined && raw.pageTriggerType !== "cron")
     log.warn(
       "config",
-      'pageTriggerType "cron" needs pageTriggerCron (UTC 5-field, e.g. "0 3 * * *") — ' +
-        'falling back to "auto-refresh"'
+      `ignoring pageTriggerType=${JSON.stringify(raw.pageTriggerType)} — ` +
+        "expected cron|auto-refresh|manual"
     );
-  }
-  return "auto-refresh";
+  const cron = raw.pageTriggerCron?.trim();
+  if (!cron) return { type: "cron", cron: DEFAULT_PAGE_TRIGGER_CRON };
+  if (!isHashedCron(cron) || parseHashedCron(cron)) return { type: "cron", cron };
+  log.warn(
+    "config",
+    `pageTriggerCron ${JSON.stringify(cron)} has a malformed hashed field — ` +
+      'write `H` or `H(<lo>-<hi>)` within the field\'s own range, e.g. "H H(0-5) * * *" — ' +
+      `falling back to ${JSON.stringify(DEFAULT_PAGE_TRIGGER_CRON)}`
+  );
+  return { type: "cron", cron: DEFAULT_PAGE_TRIGGER_CRON };
 }
 
+/** Default timeout for the automatic hook reflect — see RawConfig.reflectTimeoutMs. */
+export const DEFAULT_REFLECT_TIMEOUT_MS = 20_000;
 /** Default timeout for the agent-invoked `hindsight_reflect` tool — see RawConfig.reflectToolTimeoutMs. */
 export const DEFAULT_REFLECT_TOOL_TIMEOUT_MS = 330_000;
 
@@ -307,6 +336,7 @@ export function resolveConfig(raw: RawConfig = {}): Config {
     ? (raw.serverMode as "cloud" | "self-hosted" | "daemon")
     : "cloud";
   const apiPort = raw.apiPort || DEFAULT_DAEMON_PORT;
+  const pageTrigger = resolvePageTrigger(raw);
   return {
     serverMode,
     // Daemon mode resolves the URL HERE rather than at each call site: every entry point already
@@ -337,7 +367,7 @@ export function resolveConfig(raw: RawConfig = {}): Config {
     retainSessions: raw.retainSessions ?? true, // write sessions back by default, every harness
     manageBankConfig: raw.manageBankConfig ?? true,
     maxParallelRetains: raw.maxParallelRetains || 10,
-    reflectTimeoutMs: raw.reflectTimeoutMs || 120000,
+    reflectTimeoutMs: raw.reflectTimeoutMs || DEFAULT_REFLECT_TIMEOUT_MS,
     // Inherit an explicitly-raised reflectTimeoutMs (that is what users reaching for a longer
     // reflect already set), but never let it LOWER the tool below the default — a short window is
     // set to bound the automatic hook, not to cut off a call the agent is waiting on.
@@ -347,8 +377,8 @@ export function resolveConfig(raw: RawConfig = {}): Config {
     reflectBudget: resolveReflectBudget(raw),
     autoReflect: raw.autoReflect ?? true,
     pageRefreshEveryTurns: raw.pageRefreshEveryTurns || 10,
-    pageTriggerType: resolvePageTriggerType(raw),
-    pageTriggerCron: raw.pageTriggerCron?.trim() || undefined,
+    pageTriggerType: pageTrigger.type,
+    pageTriggerCron: pageTrigger.cron,
     autoSeed: raw.autoSeed ?? true,
     seedLimit: raw.seedLimit || DEFAULT_SEED_LIMIT,
     codebaseSurvey: raw.codebaseSurvey ?? true,

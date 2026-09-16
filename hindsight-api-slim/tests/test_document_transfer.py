@@ -9,6 +9,7 @@ import io
 import json
 import uuid
 import zipfile
+from urllib.parse import quote
 from datetime import datetime, timezone
 
 import httpx
@@ -16,6 +17,8 @@ import pytest
 import pytest_asyncio
 
 from hindsight_api.api import create_app
+from hindsight_api.engine.storage import bank_storage_prefix
+from hindsight_api.engine.chunk_ids import build_chunk_id
 from hindsight_api.engine.consolidation.consolidator import (
     _apply_create_observation,
     _embed_observation_text,
@@ -217,9 +220,9 @@ async def test_import_filters_degenerate_fact_without_shifting_archive_ordinals(
 
         units_by_text = {unit["text"]: unit for unit in units}
         assert "..." not in units_by_text
-        assert units_by_text[initial_text]["chunk_id"] == f"{dst}_{document_id}_0"
-        assert units_by_text[middle_text]["chunk_id"] == f"{dst}_{document_id}_2"
-        assert units_by_text[later_text]["chunk_id"] == f"{dst}_{document_id}_3"
+        assert units_by_text[initial_text]["chunk_id"] == build_chunk_id(dst, document_id, 0)
+        assert units_by_text[middle_text]["chunk_id"] == build_chunk_id(dst, document_id, 2)
+        assert units_by_text[later_text]["chunk_id"] == build_chunk_id(dst, document_id, 3)
         assert {str(source_id) for source_id in units_by_text[observation_text]["source_memory_ids"]} == {
             str(units_by_text[later_text]["id"])
         }
@@ -1586,7 +1589,7 @@ async def test_http_export_import_endpoints(api_client, memory, request_context)
         export_meta = export_status.json()["result_metadata"]
         assert export_meta["byte_size"] > 0
         download_url = export_meta["download_url"]
-        assert download_url.startswith("/v1/default/files/download/banks/")
+        assert download_url.startswith("/v1/default/files/download/tenants/")
 
         # Download the finished archive through the download route.
         download = await api_client.get(download_url)
@@ -1836,8 +1839,10 @@ async def test_async_export_roundtrip(memory, request_context):
         await _retain(memory, src, "Alice works at Google. Bob works at Microsoft.", request_context, "doc-1")
 
         meta, archive = await _export_async(memory, src, request_context)
-        assert meta["storage_key"].startswith(f"banks/{src}/exports/")
-        assert meta["download_url"] == f"/v1/default/files/download/{meta['storage_key']}"
+        # The bank id carries a dot, which the key encodes, so derive the prefix.
+        assert meta["storage_key"].startswith(f"{bank_storage_prefix(src)}exports/")
+        # URL-quoted, so the key's own %-escapes survive the server's path decoding.
+        assert meta["download_url"] == f"/v1/default/files/download/{quote(meta['storage_key'])}"
         assert meta["byte_size"] == len(archive)
         assert meta["filename"] == f"{src}-documents.zip"
 
@@ -2296,7 +2301,7 @@ class _RecordingEmbedder:
     def __init__(self):
         self.batch_sizes: list[int] = []
 
-    def encode_documents(self, texts: list[str]) -> list[list[float]]:
+    async def encode_documents(self, texts: list[str]) -> list[list[float]]:
         self.batch_sizes.append(len(texts))
         return [[float(len(text)), 0.0] for text in texts]
 
